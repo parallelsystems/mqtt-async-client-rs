@@ -416,15 +416,15 @@ impl Client {
         let h = self.check_io_task_mut()?;
         let r = h.rx_recv_published.recv().await;
 
-        self.handle_received_packet(r).await
+        self.handle_received_packet(r)
     }
 
-    /// Attempt to fetch the next Publish packet for one of this Client's subscriptions but return immediately.
-    /// Syncronous version of `read_subscriptions()`.
-    pub async fn try_read_subscriptions(&mut self) -> Option<Result<ReadResult>> {
+    /// Attempt to fetch the next Publish packet for one of this Client's subscriptions
+    /// but return immediately. Syncronous version of `read_subscriptions()`.
+    pub fn try_read_subscriptions(&mut self) -> Option<Result<ReadResult>> {
         match self.check_io_task_mut() {
             Ok(h) => match h.rx_recv_published.try_recv() {
-                Ok(r) => Some(self.handle_received_packet(Some(r)).await),
+                Ok(r) => Some(self.handle_received_packet(Some(r))),
                 Err(error) => match error {
                     TryRecvError::Empty => None,
                     TryRecvError::Disconnected => Some(Err(Error::Disconnected)),
@@ -435,10 +435,7 @@ impl Client {
     }
 
     /// Process a packed read from a `read_subscriptions...` call
-    async fn handle_received_packet(
-        &mut self,
-        packet: Option<Result<Packet>>,
-    ) -> Result<ReadResult> {
+    fn handle_received_packet(&mut self, packet: Option<Result<Packet>>) -> Result<ReadResult> {
         let packet = match packet {
             Some(r) => r?,
             None => {
@@ -453,7 +450,7 @@ impl Client {
                 match p.qospid {
                     QosPid::AtMostOnce => (),
                     QosPid::AtLeastOnce(pid) => {
-                        self.write_only_packet(&Packet::Puback(pid)).await?;
+                        self.write_only_packet_blocking(&Packet::Puback(pid))?;
                     }
                     QosPid::ExactlyOnce(_) => {
                         error!("Received publish with unimplemented QoS: ExactlyOnce");
@@ -522,6 +519,11 @@ impl Client {
             .map(|_v| ())
     }
 
+    fn write_only_packet_blocking(&self, p: &Packet) -> Result<()> {
+        self.write_request_blocking(IoType::WriteOnly { packet: p.clone() }, None)
+            .map(|_v| ())
+    }
+
     async fn write_response_packet(&self, p: &Packet) -> Result<Packet> {
         let io_type = IoType::WriteAndResponse {
             packet: p.clone(),
@@ -547,6 +549,22 @@ impl Client {
             .clone()
             .send(req)
             .await
+            .map_err(|e| Error::from_std_err(e))?;
+        Ok(())
+    }
+
+    fn write_request_blocking(
+        &self,
+        io_type: IoType,
+        tx_result: Option<oneshot::Sender<IoResult>>,
+    ) -> Result<()> {
+        // NB: Some duplication in IoTask::replay_subscriptions.
+
+        let c = self.check_io_task()?;
+        let req = IoRequest { tx_result, io_type };
+        c.tx_io_requests
+            .clone()
+            .blocking_send(req)
             .map_err(|e| Error::from_std_err(e))?;
         Ok(())
     }
