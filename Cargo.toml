@@ -19,7 +19,7 @@ url = "2.2.2"
 rustls = { version = "0.20", optional = true }
 rustls-native-certs = { version = "0.6", optional = true }
 http = { version = "0.2.4", optional = true }
-tokio = { version = "1.2.0", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.15.0", features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = { version = "0.23", optional = true }
 tokio-tungstenite = { version = "0.16", optional = true, features = ["rustls-tls-native-roots"] }
 
