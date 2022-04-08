@@ -414,9 +414,16 @@ impl Client {
     /// Wait for the next Publish packet for one of this Client's subscriptions.
     pub async fn read_subscriptions(&mut self) -> Result<ReadResult> {
         let h = self.check_io_task_mut()?;
-        let r = h.rx_recv_published.recv().await;
+        let packet = match h.rx_recv_published.recv().await {
+            Some(r) => r?,
+            None => {
+                // Sender closed.
+                self.io_task_handle = None;
+                return Err(Error::Disconnected);
+            }
+        };
 
-        self.handle_received_packet(r).await
+        self.handle_received_packet(packet).await
     }
 
     /// Attempt to fetch the next Publish packet for one of this Client's subscriptions
@@ -424,7 +431,10 @@ impl Client {
     pub fn try_read_subscriptions(&mut self) -> Option<Result<ReadResult>> {
         match self.check_io_task_mut() {
             Ok(h) => match h.rx_recv_published.try_recv() {
-                Ok(r) => Some(self.handle_received_packet_blocking(Some(r))),
+                Ok(r) => match r {
+                    Ok(packet) => Some(self.handle_received_packet_blocking(packet)),
+                    Err(error) => Some(Err(error)),
+                },
                 Err(error) => match error {
                     TryRecvError::Empty => None,
                     TryRecvError::Disconnected => Some(Err(Error::Disconnected)),
@@ -435,19 +445,7 @@ impl Client {
     }
 
     /// Process a packed read from a `read_subscriptions...` call
-    async fn handle_received_packet(
-        &mut self,
-        packet: Option<Result<Packet>>,
-    ) -> Result<ReadResult> {
-        let packet = match packet {
-            Some(r) => r?,
-            None => {
-                // Sender closed.
-                self.io_task_handle = None;
-                return Err(Error::Disconnected);
-            }
-        };
-
+    async fn handle_received_packet(&mut self, packet: Packet) -> Result<ReadResult> {
         match packet {
             Packet::Publish(p) => {
                 match p.qospid {
@@ -472,19 +470,7 @@ impl Client {
     }
 
     /// Process a packed read from a `read_subscriptions...` call (blocking)
-    fn handle_received_packet_blocking(
-        &mut self,
-        packet: Option<Result<Packet>>,
-    ) -> Result<ReadResult> {
-        let packet = match packet {
-            Some(r) => r?,
-            None => {
-                // Sender closed.
-                self.io_task_handle = None;
-                return Err(Error::Disconnected);
-            }
-        };
-
+    fn handle_received_packet_blocking(&mut self, packet: Packet) -> Result<ReadResult> {
         match packet {
             Packet::Publish(p) => {
                 match p.qospid {
