@@ -416,7 +416,7 @@ impl Client {
         let h = self.check_io_task_mut()?;
         let r = h.rx_recv_published.recv().await;
 
-        self.handle_received_packet(r)
+        self.handle_received_packet(r).await
     }
 
     /// Attempt to fetch the next Publish packet for one of this Client's subscriptions
@@ -424,7 +424,7 @@ impl Client {
     pub fn try_read_subscriptions(&mut self) -> Option<Result<ReadResult>> {
         match self.check_io_task_mut() {
             Ok(h) => match h.rx_recv_published.try_recv() {
-                Ok(r) => Some(self.handle_received_packet(Some(r))),
+                Ok(r) => Some(self.handle_received_packet_blocking(Some(r))),
                 Err(error) => match error {
                     TryRecvError::Empty => None,
                     TryRecvError::Disconnected => Some(Err(Error::Disconnected)),
@@ -435,7 +435,47 @@ impl Client {
     }
 
     /// Process a packed read from a `read_subscriptions...` call
-    fn handle_received_packet(&mut self, packet: Option<Result<Packet>>) -> Result<ReadResult> {
+    async fn handle_received_packet(
+        &mut self,
+        packet: Option<Result<Packet>>,
+    ) -> Result<ReadResult> {
+        let packet = match packet {
+            Some(r) => r?,
+            None => {
+                // Sender closed.
+                self.io_task_handle = None;
+                return Err(Error::Disconnected);
+            }
+        };
+
+        match packet {
+            Packet::Publish(p) => {
+                match p.qospid {
+                    QosPid::AtMostOnce => (),
+                    QosPid::AtLeastOnce(pid) => {
+                        self.write_only_packet(&Packet::Puback(pid)).await?;
+                    }
+                    QosPid::ExactlyOnce(_) => {
+                        error!("Received publish with unimplemented QoS: ExactlyOnce");
+                    }
+                }
+                let rr = ReadResult {
+                    topic: p.topic_name,
+                    payload: p.payload,
+                };
+                Ok(rr)
+            }
+            _ => {
+                return Err(format!("Unexpected packet waiting for read: {:#?}", packet).into());
+            }
+        }
+    }
+
+    /// Process a packed read from a `read_subscriptions...` call (blocking)
+    fn handle_received_packet_blocking(
+        &mut self,
+        packet: Option<Result<Packet>>,
+    ) -> Result<ReadResult> {
         let packet = match packet {
             Some(r) => r?,
             None => {
