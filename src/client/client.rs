@@ -32,6 +32,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
+    runtime::Handle,
     sync::{
         mpsc::{self, error::TryRecvError},
         oneshot,
@@ -426,8 +427,16 @@ impl Client {
         self.handle_received_packet(packet).await
     }
 
-    /// Attempt to fetch the next Publish packet for one of this Client's subscriptions
-    /// but return immediately. Syncronous version of `read_subscriptions()`.
+    /// Attempt to fetch the next Publish packet for one of this Client's
+    /// subscriptions but return immediately. Syncronous version of
+    /// `read_subscriptions()`.
+    ///
+    /// TODO: Figure out why `try_recv()` and `try_poll()` are so cpu intensive
+    /// (makes hootl binary running two vehicles go from 50% cpu usage to >200%).
+    /// Seems as though they possibly are only meant to be used to check if there
+    /// are messages on the receiver, rather than being the primary way to extract
+    /// messages from the receiver.
+    /// Until then, this function is too cpu intentsive to use
     pub fn try_read_subscriptions(&mut self) -> Option<Result<ReadResult>> {
         match self.check_io_task_mut() {
             Ok(h) => match h.rx_recv_published.try_recv() {
@@ -546,7 +555,7 @@ impl Client {
     }
 
     fn write_only_packet_blocking(&self, p: &Packet) -> Result<()> {
-        self.write_request_blocking(IoType::WriteOnly { packet: p.clone() }, None)
+        self.write_request_spawned(IoType::WriteOnly { packet: p.clone() }, None)
             .map(|_v| ())
     }
 
@@ -579,7 +588,7 @@ impl Client {
         Ok(())
     }
 
-    fn write_request_blocking(
+    fn write_request_spawned(
         &self,
         io_type: IoType,
         tx_result: Option<oneshot::Sender<IoResult>>,
@@ -587,11 +596,12 @@ impl Client {
         // NB: Some duplication in IoTask::replay_subscriptions.
 
         let c = self.check_io_task()?;
+        let sender = c.tx_io_requests.clone();
         let req = IoRequest { tx_result, io_type };
-        c.tx_io_requests
-            .clone()
-            .blocking_send(req)
-            .map_err(|e| Error::from_std_err(e))?;
+        Handle::current().spawn_blocking(move || match sender.blocking_send(req) {
+            Ok(_) => {}
+            Err(error) => error!("{}", error),
+        });
         Ok(())
     }
 
