@@ -430,14 +430,14 @@ impl Client {
     /// Attempt to fetch the next Publish packet for one of this Client's
     /// subscriptions but return immediately. Syncronous version of
     /// `read_subscriptions()`.
+    ///
+    /// TODO: Figure out why `try_recv()` and `try_poll()` are so cpu intensive
+    /// (makes hootl binary running two vehicles go from 50% cpu usage to >200%).
+    /// Seems as though they possibly are only meant to be used to check if there
+    /// are messages on the receiver, rather than being the primary way to extract
+    /// messages from the receiver.
+    /// Until then, this function is too cpu intentsive to use
     pub fn try_read_subscriptions(&mut self) -> Option<Result<ReadResult>> {
-        // TODO: Figure out why try_recv() and try_poll() are so cpu intensive
-        // (makes hootl binary running two vehicles go from 50% cpu usage to >200%).
-        // Seems as though they possibly are only meant to be used to check if there
-        // are messages on the receiver, rather than being the primary way to extract
-        // messages from the receiver.
-        // Until then, this function is too cpu intentsive to use
-
         match self.check_io_task_mut() {
             Ok(h) => match h.rx_recv_published.try_recv() {
                 Ok(r) => match r {
