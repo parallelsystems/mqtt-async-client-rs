@@ -430,14 +430,18 @@ impl Client {
     /// Attempt to fetch the next Publish packet for one of this Client's
     /// subscriptions but return immediately. Syncronous version of
     /// `read_subscriptions()`.
-    pub fn try_read_subscriptions(&mut self, handle: &Handle) -> Option<Result<ReadResult>> {
+    pub fn try_read_subscriptions(&mut self) -> Option<Result<ReadResult>> {
+        // TODO: Figure out why try_recv() and try_poll() are so cpu intensive
+        // (makes hootl binary running two vehicles go from 50% cpu usage to >200%).
+        // Seems as though they possibly are only meant to be used to check if there
+        // are messages on the receiver, rather than being the primary way to extract
+        // messages from the receiver.
+        // Until then, this function is too cpu intentsive to use
+
         match self.check_io_task_mut() {
             Ok(h) => match h.rx_recv_published.try_recv() {
                 Ok(r) => match r {
-                    Ok(packet) => {
-                        let _ = handle.enter();
-                        Some(self.handle_received_packet_blocking(packet, handle))
-                    }
+                    Ok(packet) => Some(self.handle_received_packet_blocking(packet)),
                     Err(error) => Some(Err(error)),
                 },
                 Err(error) => match error {
@@ -475,17 +479,13 @@ impl Client {
     }
 
     /// Process a packed read from a `read_subscriptions...` call (blocking)
-    fn handle_received_packet_blocking(
-        &mut self,
-        packet: Packet,
-        handle: &Handle,
-    ) -> Result<ReadResult> {
+    fn handle_received_packet_blocking(&mut self, packet: Packet) -> Result<ReadResult> {
         match packet {
             Packet::Publish(p) => {
                 match p.qospid {
                     QosPid::AtMostOnce => (),
                     QosPid::AtLeastOnce(pid) => {
-                        self.write_only_packet_blocking(&Packet::Puback(pid), handle)?;
+                        self.write_only_packet_blocking(&Packet::Puback(pid))?;
                     }
                     QosPid::ExactlyOnce(_) => {
                         error!("Received publish with unimplemented QoS: ExactlyOnce");
@@ -554,8 +554,8 @@ impl Client {
             .map(|_v| ())
     }
 
-    fn write_only_packet_blocking(&self, p: &Packet, handle: &Handle) -> Result<()> {
-        self.write_request_spawned(IoType::WriteOnly { packet: p.clone() }, None, handle)
+    fn write_only_packet_blocking(&self, p: &Packet) -> Result<()> {
+        self.write_request_spawned(IoType::WriteOnly { packet: p.clone() }, None)
             .map(|_v| ())
     }
 
@@ -592,18 +592,15 @@ impl Client {
         &self,
         io_type: IoType,
         tx_result: Option<oneshot::Sender<IoResult>>,
-        handle: &Handle,
     ) -> Result<()> {
         // NB: Some duplication in IoTask::replay_subscriptions.
 
         let c = self.check_io_task()?;
         let sender = c.tx_io_requests.clone();
         let req = IoRequest { tx_result, io_type };
-        handle.spawn(async move {
-            match sender.send(req).await {
-                Ok(_) => {}
-                Err(error) => error!("{}", error),
-            }
+        Handle::current().spawn_blocking(move || match sender.blocking_send(req) {
+            Ok(_) => {}
+            Err(error) => error!("{}", error),
         });
         Ok(())
     }
