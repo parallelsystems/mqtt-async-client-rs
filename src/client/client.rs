@@ -9,7 +9,7 @@ use crate::{
 use bytes::BytesMut;
 use futures_util::{
     future::{pending, FutureExt},
-    select,
+    select, select_biased,
 };
 #[cfg(feature = "websocket")]
 use http::request::Request;
@@ -32,10 +32,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
-    sync::{
-        mpsc::{self, error::TryRecvError},
-        oneshot,
-    },
+    sync::{mpsc, oneshot},
     time::{error::Elapsed, sleep, sleep_until, timeout, Duration, Instant},
 };
 #[cfg(feature = "tls")]
@@ -52,10 +49,10 @@ use url::Url;
 ///
 /// ```
 /// # use mqtt_async_client::client::Client;
-/// let client = Client::builder()
-///     .set_url_string("mqtt://example.com")
-///     .unwrap()
-///     .build();
+/// let client =
+///     Client::builder()
+///        .set_url_string("mqtt://example.com").unwrap()
+///        .build();
 /// ```
 ///
 /// `Client` is expected to be `Send` (passable between threads), but not
@@ -414,7 +411,7 @@ impl Client {
     /// Wait for the next Publish packet for one of this Client's subscriptions.
     pub async fn read_subscriptions(&mut self) -> Result<ReadResult> {
         let h = self.check_io_task_mut()?;
-        let packet = match h.rx_recv_published.recv().await {
+        let r = match h.rx_recv_published.recv().await {
             Some(r) => r?,
             None => {
                 // Sender closed.
@@ -422,31 +419,7 @@ impl Client {
                 return Err(Error::Disconnected);
             }
         };
-
-        self.handle_received_packet(packet).await
-    }
-
-    /// Attempt to fetch the next Publish packet for one of this Client's subscriptions
-    /// but return immediately. Syncronous version of `read_subscriptions()`.
-    pub fn try_read_subscriptions(&mut self) -> Option<Result<ReadResult>> {
-        match self.check_io_task_mut() {
-            Ok(h) => match h.rx_recv_published.try_recv() {
-                Ok(r) => match r {
-                    Ok(packet) => Some(self.handle_received_packet_blocking(packet)),
-                    Err(error) => Some(Err(error)),
-                },
-                Err(error) => match error {
-                    TryRecvError::Empty => None,
-                    TryRecvError::Disconnected => Some(Err(Error::Disconnected)),
-                },
-            },
-            Err(error) => Some(Err(error)),
-        }
-    }
-
-    /// Process a packed read from a `read_subscriptions...` call
-    async fn handle_received_packet(&mut self, packet: Packet) -> Result<ReadResult> {
-        match packet {
+        match r {
             Packet::Publish(p) => {
                 match p.qospid {
                     QosPid::AtMostOnce => (),
@@ -464,32 +437,7 @@ impl Client {
                 Ok(rr)
             }
             _ => {
-                return Err(format!("Unexpected packet waiting for read: {:#?}", packet).into());
-            }
-        }
-    }
-
-    /// Process a packed read from a `read_subscriptions...` call (blocking)
-    fn handle_received_packet_blocking(&mut self, packet: Packet) -> Result<ReadResult> {
-        match packet {
-            Packet::Publish(p) => {
-                match p.qospid {
-                    QosPid::AtMostOnce => (),
-                    QosPid::AtLeastOnce(pid) => {
-                        self.write_only_packet_blocking(&Packet::Puback(pid))?;
-                    }
-                    QosPid::ExactlyOnce(_) => {
-                        error!("Received publish with unimplemented QoS: ExactlyOnce");
-                    }
-                }
-                let rr = ReadResult {
-                    topic: p.topic_name,
-                    payload: p.payload,
-                };
-                Ok(rr)
-            }
-            _ => {
-                return Err(format!("Unexpected packet waiting for read: {:#?}", packet).into());
+                return Err(format!("Unexpected packet waiting for read: {:#?}", r).into());
             }
         }
     }
@@ -545,11 +493,6 @@ impl Client {
             .map(|_v| ())
     }
 
-    fn write_only_packet_blocking(&self, p: &Packet) -> Result<()> {
-        self.write_request_blocking(IoType::WriteOnly { packet: p.clone() }, None)
-            .map(|_v| ())
-    }
-
     async fn write_response_packet(&self, p: &Packet) -> Result<Packet> {
         let io_type = IoType::WriteAndResponse {
             packet: p.clone(),
@@ -575,22 +518,6 @@ impl Client {
             .clone()
             .send(req)
             .await
-            .map_err(|e| Error::from_std_err(e))?;
-        Ok(())
-    }
-
-    fn write_request_blocking(
-        &self,
-        io_type: IoType,
-        tx_result: Option<oneshot::Sender<IoResult>>,
-    ) -> Result<()> {
-        // NB: Some duplication in IoTask::replay_subscriptions.
-
-        let c = self.check_io_task()?;
-        let req = IoRequest { tx_result, io_type };
-        c.tx_io_requests
-            .clone()
-            .blocking_send(req)
             .map_err(|e| Error::from_std_err(e))?;
         Ok(())
     }
@@ -927,11 +854,10 @@ impl IoTask {
 
         let pingresp_expected_by =
             if self.options.keep_alive.is_enabled() && c.last_pingreq_time > c.last_pingresp_time {
-                // Expect a ping response before the operation timeout and the keepalive
-                // interval. If the keepalive interval expired first then the
-                // "next operation" as returned by SelectResult below would be
-                // Ping even when Pingresp is expected, and we would never time
-                // out the connection.
+                // Expect a ping response before the operation timeout and the keepalive interval.
+                // If the keepalive interval expired first then the "next operation" as
+                // returned by SelectResult below would be Ping even when Pingresp is expected,
+                // and we would never time out the connection.
                 let ka = self.options.keep_alive.as_duration().expect("enabled");
                 Some(c.last_pingreq_time + min(self.options.operation_timeout, ka))
             } else {
@@ -972,9 +898,9 @@ impl IoTask {
                 Some(t) => Box::pin(sleep_until(t).boxed().fuse()),
                 None => Box::pin(pending().boxed().fuse()),
             };
-            select! {
-                req = req_fut => SelectResult::IoReq(req),
+            select_biased! {
                 read = read_fut => SelectResult::Read(read),
+                req = req_fut => SelectResult::IoReq(req),
                 _ = ping_fut => SelectResult::Ping,
                 _ = pingresp_expected_fut => SelectResult::PingrespExpected,
             }
