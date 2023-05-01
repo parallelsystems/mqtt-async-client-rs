@@ -863,7 +863,7 @@ impl IoTask {
             } else {
                 None
             };
-
+        info!("Run once connected");
         // Select over futures to determine what to do next:
         // * Handle a write request from the Client
         // * Handle an incoming packet from the network
